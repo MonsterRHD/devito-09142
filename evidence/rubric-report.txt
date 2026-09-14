@@ -1,0 +1,9 @@
+项目：devitocodes-devito-cd216173-4e92-4a94-8c9b-7b0656f6f2f8｜MPI 编译器探测、JIT 工具链与缓存一致性
+Session：6aa75fd523ecb4dbbe88783e｜Harness：Trae｜有效轮数：97
+Rubric ID：1｜状态：通过｜期望行为：MPICH 包装器提供可用编译和链接选项并继续完成 MPI 算子 JIT｜实际观察：真实 MPICH 5.0.1 返回 include、library、mpi 和 pmpi 参数，2 rank Devito Operator 完成 JIT、加载动态库并在各 rank 得到正确结果｜直接证据：compiler.py:332-416；真实 MPICH JIT 两个 rank 均为 lib=True ok=True
+Rubric ID：2｜状态：通过｜期望行为：引号路径、重复参数和空字段稳定解析且不拆坏参数｜实际观察：shlex 按行解析，选项和值按原子分组后保序去重；带空格路径、重复库、空字符串与 legacy 输出断言全部通过｜直接证据：compiler.py:228-369；tests/test_arch.py:162-204；20 passed
+Rubric ID：3｜状态：通过｜期望行为：MPI 选项进入缓存身份，同配置复用而配置变化产生不同结果｜实际观察：MPICH 选项进入 Hip/CUDA 工具链的 cflags 与 ldflags 及 abi_id；相同配置签名一致，切换 include/library 路径后签名变化｜直接证据：compiler.py:1006-1030、1085-1090；tests/test_arch.py:286-340；缓存签名用例通过
+Rubric ID：4｜状态：通过｜期望行为：未知发行版、命令不可执行和输出不可解析具有可区分原因，显式选项仍可用｜实际观察：三类失败分别产生 unrecognised、not executable 和 parse 诊断；自定义编译器的 CFLAGS/LDFLAGS 保留并通过断言｜直接证据：compiler.py:196-245、372-416；tests/test_arch.py:225-271、343-360；对应用例通过
+Rubric ID：5｜状态：通过｜期望行为：非 MPI、OpenMPI、Spectrum MPI 探测和串行算子结果保持不变｜实际观察：OpenMPI 继续使用 showme 路径，Spectrum 分支保留；串行工具链签名不含 MPI 参数，真实 MPICH 两 rank 算子和串行回归均通过｜直接证据：compiler.py:392-399、414-416；tests/test_arch.py:274-319；20 passed
+Rubric ID：6｜状态：通过｜期望行为：失败后修正环境可成功且失败不污染探测或编译缓存｜实际观察：unknown launcher 改为 HYDRA 后同一进程探测成功，不可执行包装器恢复权限后成功；只有成功结果写入缓存并以新列表返回｜直接证据：compiler.py:174-194、386-416；tests/test_arch.py:207-256；重试用例通过
+验证摘要：tests/test_arch.py 20 passed；真实 Homebrew MPICH 5.0.1 探测得到 -g、include、library、lmpi、lpmpi；2 rank Devito MPI Operator JIT、动态库加载和结果断言全部成功；全部 pytest 命令禁用缓存。

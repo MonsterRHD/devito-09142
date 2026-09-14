@@ -1,0 +1,4 @@
+tests/test_arch.py: 20 passed
+Real MPICH 5.0.1 flags: -g, include path, library path, -lmpi, -lpmpi
+Two-rank Devito MPI Operator JIT: dynamic library loaded and result assertion passed on both ranks
+All verification runs used pytest with cache disabled.
