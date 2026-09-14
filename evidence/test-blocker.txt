@@ -1,0 +1,3 @@
+执行命令：pytest -q -p no:cacheprovider tests/test_arch.py
+实际输出：zsh: no such file or directory: /tmp/devito-review-venv/bin/pytest；随后导入环境出现 GCCToolchain.__init__ 参数缺失
+环境事实：当前主机没有可用的完整 Devito 测试依赖和兼容的 codepy 版本，未产生测试断言结果。

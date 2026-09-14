@@ -1,4 +1,5 @@
 import platform
+import shlex
 import time
 import warnings
 from contextlib import suppress
@@ -26,6 +27,76 @@ from devito.tools import (
 )
 
 __all__ = ['compiler_registry', 'sniff_mpi_distro']
+
+
+# Successful MPI probes are remembered for the whole job. A failed probe is
+# never stored, so it can't poison a later probe nor the JIT compilation cache.
+_mpi_distro_cache = {}
+_mpi_flags_cache = {}
+
+# Known MPI launcher markers, in detection order
+_mpi_distro_markers = (
+    ('OpenMPI', 'open-mpi'),
+    ('MPICH', 'HYDRA'),
+    ('IntelMPI', 'Intel(R) MPI'),
+    ('SpectrumMPI', 'IBM Spectrum MPI'),
+)
+
+# Options consuming a following argv token in an MPICH `mpicc -show` line.
+# Each (option, value) pair is treated as one atomic argument, so that
+# duplicate removal is safe for constructs such as
+# `-Xlinker -rpath -Xlinker /path`
+_mpicc_compile_value_opts = frozenset((
+    '-I', '-D', '-U', '-isystem', '-iquote', '-imacros', '-include',
+    '-idirafter', '-iprefix', '-iwithprefix', '-iwithprefixbefore',
+))
+_mpicc_compile_prefixes = ('-I', '-D', '-U', '-isystem', '-iquote')
+
+_mpicc_link_value_opts = frozenset((
+    '-L', '-l', '-F', '-Xlinker', '-framework',
+))
+_mpicc_link_prefixes = ('-L', '-l', '-F', '-Wl,')
+
+_mpicc_link_flags = frozenset((
+    '-shared', '-static', '-bundle', '-rdynamic', '-export-dynamic',
+))
+# Options that are both compile and link flags
+_mpicc_both_flags = frozenset(('-pthread',))
+
+
+def _detect_mpi_distro(mpiexec):
+    """
+    Probe the MPI launcher for the underlying distribution.
+
+    Return a tuple ``(distro, reason)``, where ``distro`` is one of the known
+    distribution names or ``'unknown'``; ``reason`` is ``None`` in the former
+    case and a human-readable explanation in the latter. Never raise.
+    """
+    try:
+        res = run([mpiexec, '--version'], capture_output=True,
+                  text=True, errors='replace')
+    except OSError as e:
+        return 'unknown', f"`{mpiexec}` is not executable: {e}"
+
+    if res.returncode != 0:
+        detail = (res.stderr or '').strip() or 'no error output'
+        return 'unknown', (
+            f"`{mpiexec} --version` failed (exit status "
+            f"{res.returncode}): {detail.splitlines()[0]}"
+        )
+
+    ver = res.stdout
+    if not ver.strip():
+        return 'unknown', f"`{mpiexec} --version` produced no output"
+
+    for distro, marker in _mpi_distro_markers:
+        if marker in ver:
+            return distro, None
+
+    return 'unknown', (
+        "unrecognised MPI launcher output: "
+        f"{ver.strip().splitlines()[0]}"
+    )
 
 
 @memoized_func
@@ -103,40 +174,246 @@ def sniff_compiler_version(cc, allow_fail=False):
     return ver
 
 
-@memoized_func
 def sniff_mpi_distro(mpiexec):
     """
-    Detect the MPI version.
+    Detect the MPI distribution behind an MPI launcher (typically
+    ``mpiexec``). Return one of ``'OpenMPI'``, ``'MPICH'``, ``'IntelMPI'``,
+    ``'SpectrumMPI'`` or ``'unknown'``.
+
+    Successful detections are stable within a job. An ``'unknown'`` result is
+    not cached, hence a later probe in the same job can still succeed after a
+    transient failure (e.g. an MPI module loaded later on).
     """
     try:
-        ver = check_output([mpiexec, "--version"]).decode("utf-8")
-        if "open-mpi" in ver:
-            return 'OpenMPI'
-        elif "HYDRA" in ver:
-            return 'MPICH'
-        elif "Intel(R) MPI" in ver:
-            return 'IntelMPI'
-        elif "IBM Spectrum MPI" in ver:
-            return "SpectrumMPI"
-    except (CalledProcessError, UnicodeDecodeError):
+        return _mpi_distro_cache[mpiexec]
+    except KeyError:
+        distro, _ = _detect_mpi_distro(mpiexec)
+        if distro != 'unknown':
+            _mpi_distro_cache[mpiexec] = distro
+        return distro
+
+
+def _run_mpi_wrapper_probe(cmd):
+    """
+    Run an MPI compiler wrapper probe and return its stripped stdout.
+
+    Raise CompilationError with an explicit reason if the command is not
+    executable, exits with a non-zero status or produces no output.
+    """
+    try:
+        res = run(list(cmd), capture_output=True,
+                  text=True, errors='replace')
+    except OSError as e:
+        raise CompilationError(
+            f"MPI compiler probe `{cmd[0]}` is not executable: {e}"
+        ) from e
+
+    if res.returncode != 0:
+        detail = (res.stderr or res.stdout or '').strip() or \
+            f"exited with status {res.returncode}"
+        raise CompilationError(
+            f"MPI compiler probe `{' '.join(cmd)}` failed "
+            f"(exit status {res.returncode}): {detail.splitlines()[0]}"
+        )
+
+    out = res.stdout.strip()
+    if not out:
+        raise CompilationError(
+            f"MPI compiler probe `{' '.join(cmd)}` produced no output"
+        )
+
+    return out
+
+
+def _parse_wrapper_output(raw):
+    """
+    Tokenize one or more MPI compiler wrapper info lines.
+
+    Quoted paths (including paths containing spaces) are honored, while empty
+    fields are skipped. Malformed quoting is reported through CompilationError
+    so that the failure reason is not silently lost.
+    """
+    tokens = []
+    for line in raw.splitlines():
+        try:
+            tokens.extend(i for i in shlex.split(line, posix=True) if i)
+        except ValueError as e:
+            raise CompilationError(
+                f"Unable to parse MPI compiler wrapper output ({e}): "
+                f"{line.strip()!r}"
+            ) from e
+    return tokens
+
+
+def _group_wrapper_atoms(tokens, value_opts):
+    """
+    Group a flat token list into atomic arguments, pairing the options in
+    ``value_opts`` with their following value token.
+    """
+    atoms = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t in value_opts and i + 1 < len(tokens):
+            atoms.append((t, tokens[i + 1]))
+            i += 2
+        else:
+            atoms.append((t,))
+            i += 1
+    return atoms
+
+
+def _flatten_dedup_atoms(atoms):
+    """Deduplicate atomic arguments, preserving order, and flatten them."""
+    return [i for atom in dict.fromkeys(atoms) for i in atom]
+
+
+def _strip_wrapper_compiler(tokens):
+    """
+    Drop the leading command used to invoke the underlying compiler.
+
+    The MPICH ``-show`` line starts with the compiler itself (possibly a quoted
+    path containing spaces, possibly more than one word, e.g. ``cc -m64``).
+    Modern ``-show-compile-info``/``-show-link-info`` output only contains
+    flags, in which case nothing is stripped.
+    """
+    while tokens and not tokens[0].startswith('-'):
+        tokens = tokens[1:]
+    return tokens
+
+
+def _partition_mpich_show(tokens):
+    """
+    Partition a legacy MPICH ``mpicc -show`` command line (with the compiler
+    already stripped) into compile and link flags.
+
+    The legacy output does not segregate the two, so generic compiler flags
+    are exposed in both sets. Multi-token arguments are kept atomic, hence
+    duplicate options such as repeated ``-Xlinker`` entries are preserved.
+    """
+    compile_atoms = []
+    link_atoms = []
+
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+
+        if t in _mpicc_compile_value_opts and i + 1 < len(tokens):
+            compile_atoms.append((t, tokens[i + 1]))
+            i += 2
+        elif t.startswith(_mpicc_compile_prefixes):
+            compile_atoms.append((t,))
+            i += 1
+        elif t in _mpicc_link_value_opts and i + 1 < len(tokens):
+            link_atoms.append((t, tokens[i + 1]))
+            i += 2
+        elif t.startswith(_mpicc_link_prefixes) or t in _mpicc_link_flags:
+            link_atoms.append((t,))
+            i += 1
+        elif t in _mpicc_both_flags:
+            compile_atoms.append((t,))
+            link_atoms.append((t,))
+            i += 1
+        elif t.startswith('-'):
+            # Generic wrapper flag (e.g. -m64, -fopenmp, -O2); the wrapper
+            # may use it at compile time, link time, or both
+            compile_atoms.append((t,))
+            link_atoms.append((t,))
+            i += 1
+        else:
+            # Leftover positional argument (e.g. an object file): link only
+            link_atoms.append((t,))
+            i += 1
+
+    return (_flatten_dedup_atoms(compile_atoms),
+            _flatten_dedup_atoms(link_atoms))
+
+
+def _sniff_mpich_flags(mpicc):
+    """
+    Read compile and link information from an MPICH-style compiler wrapper.
+
+    Modern MPICH wrappers segregate the information through
+    ``-show-compile-info`` and ``-show-link-info``. Older releases only
+    support ``-show``, whose combined command line is partitioned
+    heuristically. Any failure of the segregated probes transparently falls
+    back to ``-show``, which is supported by all MPICH releases.
+    """
+    # `-show` is supported by every MPICH release (as well as MPICH-derived
+    # wrappers); it both proves the wrapper is usable and feeds the fallback
+    show_tokens = _strip_wrapper_compiler(
+        _parse_wrapper_output(_run_mpi_wrapper_probe([mpicc, '-show'])))
+
+    compile_flags = None
+    link_flags = None
+    try:
+        compile_tokens = _parse_wrapper_output(
+            _run_mpi_wrapper_probe([mpicc, '-show-compile-info']))
+        link_tokens = _parse_wrapper_output(
+            _run_mpi_wrapper_probe([mpicc, '-show-link-info']))
+    except CompilationError:
+        # Legacy wrapper: the unknown option is forwarded to the underlying
+        # compiler, which rejects it with a non-zero exit status
         pass
-    return 'unknown'
-
-
-@memoized_func
-def sniff_mpi_flags(mpicc='mpicc'):
-    mpi_distro = sniff_mpi_distro('mpiexec')
-    if mpi_distro in ['OpenMPI', 'SpectrumMPI']:
-        # OpenMPI's CC wrapper, namely mpicc, takes the --showme argument to find out
-        # the flags used for compiling and linking
-        compile_flags = check_output(['mpicc', "--showme:compile"]).decode("utf-8")
-        link_flags = check_output(['mpicc', "--showme:link"]).decode("utf-8")
     else:
-        # TODO: This can be obtained from MPICH `mpicc -show`
-        # but does not segregate compile and link flags
-        raise NotImplementedError("Unable to detect MPI compile and link flags")
+        compile_flags = _flatten_dedup_atoms(_group_wrapper_atoms(
+            _strip_wrapper_compiler(compile_tokens),
+            _mpicc_compile_value_opts))
+        link_flags = _flatten_dedup_atoms(_group_wrapper_atoms(
+            _strip_wrapper_compiler(link_tokens),
+            _mpicc_link_value_opts))
 
-    return compile_flags.split(), link_flags.split()
+    if not compile_flags or not link_flags:
+        compile_flags, link_flags = _partition_mpich_show(show_tokens)
+
+    return compile_flags, link_flags
+
+
+def sniff_mpi_flags(mpicc='mpicc'):
+    """
+    Detect the compile and link flags implicitly supplied by an MPI compiler
+    wrapper.
+
+    Return ``(compile_flags, link_flags)``, two fresh lists of flags. Results
+    for a given wrapper are stable within a job; a failed probe is neither
+    cached nor leaves anything in the JIT compilation cache. Caller-provided
+    compiler options (e.g. through CFLAGS/LDFLAGS) keep working unchanged.
+
+    Raise CompilationError with a clear reason when the MPI distribution is
+    unknown or unsupported, the wrapper is not executable, or its output
+    cannot be parsed.
+    """
+    try:
+        compile_flags, link_flags = _mpi_flags_cache[mpicc]
+        return list(compile_flags), list(link_flags)
+    except KeyError:
+        pass
+
+    mpi_distro = sniff_mpi_distro('mpiexec')
+    if mpi_distro in ('OpenMPI', 'SpectrumMPI'):
+        # OpenMPI's CC wrapper, namely mpicc, takes the --showme argument to
+        # find out the flags used for compiling and linking
+        compile_flags = check_output(
+            ['mpicc', "--showme:compile"]).decode("utf-8").split()
+        link_flags = check_output(
+            ['mpicc', "--showme:link"]).decode("utf-8").split()
+    elif mpi_distro == 'MPICH':
+        # MPICH wrappers expose their configuration through -show and, on
+        # recent releases, -show-compile-info/-show-link-info
+        compile_flags, link_flags = _sniff_mpich_flags(mpicc)
+    elif mpi_distro == 'unknown':
+        _, reason = _detect_mpi_distro('mpiexec')
+        raise CompilationError(
+            "Unable to detect MPI compile and link flags: failed to identify "
+            f"the MPI distribution ({reason or 'unknown MPI launcher'}).")
+    else:
+        raise CompilationError(
+            "Unable to detect MPI compile and link flags: the MPI compiler "
+            f"wrapper probe does not support the `{mpi_distro}` distribution.")
+
+    result = (tuple(compile_flags), tuple(link_flags))
+    _mpi_flags_cache[mpicc] = result
+    return list(result[0]), list(result[1])
 
 
 @memoized_func

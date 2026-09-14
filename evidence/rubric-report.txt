@@ -1,0 +1,9 @@
+项目：MPI 编译器探测、JIT 工具链与缓存一致性
+Session：6aa75fd523ecb4dbbe88783e
+Rubric ID：1｜状态：未通过｜期望行为：MPICH 选项用于 MPI 算子的 JIT 编译｜实际观察：代码加入 MPICH 分支，但本机未运行真实 MPICH 包装器或 JIT｜直接证据：compiler.py:332-415；测试环境阻断｜原因：缺少 MPICH 编译证据｜影响：MPICH 选项完成实际编译的行为未通过验证｜证据位置：evidence/test-blocker.txt
+Rubric ID：2｜状态：通过｜期望行为：引号路径、重复参数和空字段稳定解析｜实际观察：shlex.split 解析并过滤空字段，原子参数保序去重｜直接证据：compiler.py:228-326；compileall 返回 compileall-ok
+Rubric ID：3｜状态：未通过｜期望行为：MPI 选项参与缓存身份｜实际观察：flags 注入 cflags 和 ldflags，但未执行 codepy 缓存复用与变更重编译｜直接证据：compiler.py:1008-1030；导入因 GCCToolchain 参数不兼容失败｜原因：缺少缓存行为证据｜影响：缓存键包含全部探测选项的行为未通过验证｜证据位置：evidence/test-blocker.txt
+Rubric ID：4｜状态：未通过｜期望行为：探测失败原因可区分且显式选项仍可用｜实际观察：代码构造 CompilationError 并保留显式 flags 路径，但异常场景未运行｜直接证据：compiler.py:200-226、372-415、1008-1030｜原因：缺少异常回退证据｜影响：错误分类和显式选项保留未通过行为验证｜证据位置：evidence/test-blocker.txt
+Rubric ID：5｜状态：通过｜期望行为：非 MPI、OpenMPI、Spectrum MPI 和串行结果不变｜实际观察：旧发行版分支和默认 Compiler 路径保留｜直接证据：compiler.py:392-414、490-557
+Rubric ID：6｜状态：未通过｜期望行为：失败后修正环境可成功且不污染缓存｜实际观察：成功结果缓存，失败不写入缓存，但未执行重试序列｜直接证据：compiler.py:177-198、372-415｜原因：缺少重试证据｜影响：失败后的探测与缓存状态未通过行为验证｜证据位置：evidence/test-blocker.txt
+验证摘要：固定基线 110423337f7f3e7e618beefde76a35cfb785a665；代码编译检查通过；行为测试因依赖和 codepy API 环境阻断。完成度：部分完成。
