@@ -1,5 +1,6 @@
 import weakref
 from collections.abc import Iterable
+from itertools import count
 
 import numpy as np
 
@@ -10,6 +11,14 @@ from devito.parameters import configuration
 from devito.tools import as_list, as_tuple, is_integer
 
 __all__ = ['Data']
+
+# Rank-independent identity of distributed allocations. Under SPMD every rank
+# constructs its distributed arrays in the same program order, so this number
+# identifies the same logical array on every rank. The distributed indexing
+# engine uses it to keep the communication channels of distinct arrays with
+# identical shape and decomposition apart.
+_distributed_identity = count()
+_NO_IDENTITY = -1
 
 
 class Data(np.ndarray):
@@ -59,6 +68,11 @@ class Data(np.ndarray):
         obj._modulo = modulo or (False,)*len(shape)
         obj._distributor = distributor
 
+        # Stable identity shared by this allocation on every SPMD rank;
+        # views propagate it via `__array_finalize__`.
+        obj._dist_uid = (next(_distributed_identity)
+                         if distributor is not None else _NO_IDENTITY)
+
         # This cannot be a property, as Data objects constructed from this
         # object might not have any `decomposition`, but they would still be
         # distributed. Hence, in `__array_finalize__` we must copy this value
@@ -97,6 +111,11 @@ class Data(np.ndarray):
 
         self._distributor = None
         self._index_stash = None
+
+        # Preserve the allocation identity through views (slices, `_global`,
+        # transposes, ...) so the distributed indexing engine recognizes every
+        # view of one allocation as the same logical array on every rank.
+        self._dist_uid = getattr(obj, '_dist_uid', _NO_IDENTITY)
 
         # Views or references created via operations on `obj` do not get an
         # explicit reference to the underlying allocation (`_memfree_args`);

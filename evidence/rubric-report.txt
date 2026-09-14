@@ -1,0 +1,9 @@
+项目：devitocodes-devito-9838d811-00ee-433c-be40-824a931fddb5｜分布式索引交换的消息隔离与失败回收
+Session：6aa75fdb23ecb4dbbe88784f｜Harness：Trae｜有效轮数：159
+Rubric ID：1｜状态：通过｜期望行为：同一 communicator 上并发或嵌套计划使用隔离且可回收的通信标识｜实际观察：不同 Data、dtype、get、put 与结构化路径使用内容寻址 Channel，每次调用绑定新标签；4 rank 双线程连续交错读写完成｜直接证据：plan.py:175-296；transport.py:107-204；并发用例通过
+Rubric ID：2｜状态：通过｜期望行为：请求头与 payload 在不同 dtype、Data、self 路径和连续复用中始终配对｜实际观察：envelope 与 payload 使用同一调用的四标签和 magic，self 投递绕过 MPI；int32 与 int64 计划交错 20 轮结果正确｜直接证据：transport.py:284-410；tests/test_data.py:1118-1181；真实 MPI 验证通过
+Rubric ID：3｜状态：通过｜期望行为：越界或重复赋值由所有 rank 一致退出并清理未完成发送｜实际观察：4 rank 对重复赋值和越界 get/put 均收到含 rank 0 的一致 ValueError，错误阶段完成空 payload；发布或等待失败均取消、等待并释放已创建请求｜直接证据：plan.py:480-549；transport.py:220-402；异常与清理用例通过
+Rubric ID：4｜状态：通过｜期望行为：传输失败后新计划或切换 get/put 可恢复且不继承旧请求、标签或 buffer｜实际观察：Irecv 与 Isend 发布失败会排空部分请求并释放 Channel 锁，下一调用获得新标签；4 rank 在重复和越界失败后继续完成有效 get 与 put｜直接证据：transport.py:314-402；tests/test_data.py:20-91；错误后恢复序列通过
+Rubric ID：5｜状态：通过｜期望行为：单进程和 MPI=full 的全局索引、广播赋值、负步长和 dtype 映射保持不变｜实际观察：分布式 Data 全组覆盖索引、广播、负步长、结构化赋值和 dtype 路径，在真实 MPICH 下全部通过｜直接证据：tests/test_data.py::TestDataDistributed；45 passed
+Rubric ID：6｜状态：通过｜期望行为：无远端 peer 或只有 self-rank 投递时保持结果、形状与异常且不发起额外通信｜实际观察：单进程直接返回，self buffer 本地交付；local-only 用例禁止通信调用后仍得到正确结果和形状｜直接证据：transport.py:284-303；tests/test_data.py:1182-1206；全组验证通过
+验证摘要：发布失败清理 2 passed；TestDataDistributed 在真实 MPICH 下 43 passed；修复后合并全量验证 45 passed；4 rank 错误后恢复序列四个 rank 均输出 recovery=ok；全部命令禁用 pytest 缓存。

@@ -20,14 +20,24 @@ The unit of exchange is one "point" (a coordinate tuple over the distributed
 axes) carrying a payload block addressed by the replicated axes.
 """
 
+import hashlib
+import struct
+from functools import cached_property
+
 import numpy as np
 
 from devito.data.distributed.selection import Affine, IndexScalar
-from devito.data.distributed.transport import sparse_exchange
-from devito.mpi import MPI
+from devito.data.distributed.transport import (
+    CONSENSUS_MESSAGES,
+    DUP_CODE,
+    OOB_CODE,
+    channel_for,
+    join_consensus_codes,
+    sparse_exchange,
+)
 from devito.tools import prod
 
-__all__ = ['ExchangePlan', 'sparse_push']
+__all__ = ['ExchangePlan', 'channel_key', 'sparse_push']
 
 
 class ExchangePlan:
@@ -70,10 +80,15 @@ class ExchangePlan:
         Message for an out-of-bounds index (checked on get and set).
     dup_error : str or None
         Message for a duplicate assignment target (checked on set only).
+    identity : bytes or None
+        Stable, rank-independent identity of the array being indexed, used to
+        keep the channels of distinct (but identically shaped) arrays apart.
+        `None` falls back to a layout/selection-content identity.
     """
 
     def __init__(self, layout, selection, perm, t_shape, payload_shape, owners,
-                 peers, block_offsets, repl_total, oob_error, dup_error):
+                 peers, block_offsets, repl_total, oob_error, dup_error,
+                 identity=None):
         self.layout = layout
         self.selection = selection
         self._perm = perm
@@ -85,11 +100,12 @@ class ExchangePlan:
         self._repl_total = repl_total
         self._oob_error = oob_error
         self._dup_error = dup_error
+        self._identity = identity
 
     # ------------------------------------------------------------------ build
 
     @classmethod
-    def build(cls, selection, layout):
+    def build(cls, selection, layout, identity=None):
         """
         Plan the exchange for `data[idx]`; the result serves both get and set.
 
@@ -99,6 +115,10 @@ class ExchangePlan:
             Normalized meaning of the index expression.
         layout : Layout
             Physical placement of the array being indexed.
+        identity : int or None, optional
+            Stable, rank-independent identity of the array being indexed (its
+            distributed allocation number). Distinct arrays with identical
+            shape and decomposition still get distinct communication channels.
 
         Returns
         -------
@@ -140,7 +160,8 @@ class ExchangePlan:
         peers, oob_error, dup_error = _group_peers(layout, owners, dist_local,
                                                    sub, gcoords)
         return cls(layout, selection, perm, t_shape, payload_shape, owners,
-                   peers, block_offsets, repl_total, oob_error, dup_error)
+                   peers, block_offsets, repl_total, oob_error, dup_error,
+                   identity=identity)
 
     # --------------------------------------------------------------- helpers
 
@@ -156,22 +177,40 @@ class ExchangePlan:
     def payload_size(self):
         return prod(self._payload_shape)
 
-    def _raise_on_error(self, check_dup):
-        """Reach consensus on local errors and raise consistently on all ranks.
+    def _channel(self, kind):
+        # The channel identifies the *array and the operation*, not the index
+        # content: the advanced-index arrays are rank-local, so two ranks in
+        # the same call legitimately drive different plans, while every header
+        # is self-describing (payload size, offsets) and every reply is
+        # gathered by the requester that asked for it. Get and put use
+        # distinct channels, since each rank may interleave them differently.
+        return channel_for(self.comm,
+                           channel_key(kind, self._identity, self.layout))
 
-        A single 1-bit `Allreduce` gates the (rare) error path so that every
-        rank raises together, avoiding a deadlock where one rank raises while the
-        others enter the exchange. This is log-depth, not an all-to-all.
-        """
-        error = self._oob_error or (self._dup_error if check_dup else None)
-        if self.nprocs > 1:
-            if self.comm.allreduce(error is not None, op=MPI.LOR):
-                messages = self.comm.allgather(error)
-                joined = "; ".join(f"rank {r}: {m}"
-                                   for r, m in enumerate(messages) if m)
-                raise ValueError(joined)
-        elif error is not None:
-            raise ValueError(error)
+    @cached_property
+    def get_channel(self):
+        """Channel driving the `get` (pull) calls of this plan."""
+        return self._channel(b'get')
+
+    @cached_property
+    def put_channel(self):
+        """Channel driving the `put` (push) calls of this plan."""
+        return self._channel(b'put')
+
+    def _error_code(self, check_dup):
+        """This rank's consensus code (out-of-bounds wins over duplicate)."""
+        if self._oob_error is not None:
+            return OOB_CODE
+        if check_dup and self._dup_error is not None:
+            return DUP_CODE
+        return 0
+
+    def _raise_on_error(self, check_dup):
+        """Raise the local error in the single-process (serial) fast path."""
+        code = self._error_code(check_dup)
+        if self.nprocs <= 1 and code:
+            raise ValueError(CONSENSUS_MESSAGES[code])
+        return code
 
     def _moved(self, local):
         """View of the rank-local array with distributed axes moved to front."""
@@ -199,23 +238,35 @@ class ExchangePlan:
         numpy.ndarray
             The indexed result, in `selection.result_shape`.
         """
-        self._raise_on_error(check_dup=False)
+        code = self._raise_on_error(check_dup=False)
         comm, ps = self.comm, self.payload_size
         dtype = local.dtype
 
         # Send each owner the offsets of the elements we want from it...
         headers = {r: _encode(ps, self._block_offsets, dist_lin)
                    for r, (_, dist_lin) in self._peers.items()}
-        requests = sparse_exchange(comm, headers, np.int64, tag=41)
 
-        # ...and reply to whoever asked us with the requested values
-        moved = self._moved(local)
-        replies = {}
-        for src, buf in requests.items():
-            block_offsets, dist_lin = _decode(buf)
-            midx = self._owner_apply(moved, dist_lin, block_offsets)
-            replies[src] = np.ascontiguousarray(moved[midx]).reshape(-1)
-        payloads = sparse_exchange(comm, replies, dtype, tag=42)
+        # ...the channel binds isolated, fresh tags to this call, so this get
+        # cannot exchange messages with any concurrent, nested or previous call
+        with self.get_channel(comm) as call:
+            requests, codes = sparse_exchange(comm, headers, np.int64, call,
+                                              step=0, code=code)
+
+            # All ranks reach the same verdict from the envelopes. On error,
+            # run the (empty) value phase to completion first, so no request
+            # is left in flight on any rank before the consistent raise.
+            if codes is not None and np.any(codes):
+                sparse_exchange(comm, {}, dtype, call, step=1)
+                raise ValueError(join_consensus_codes(codes))
+
+            # ...and reply to whoever asked us with the requested values
+            moved = self._moved(local)
+            replies = {}
+            for src, buf in requests.items():
+                block_offsets, dist_lin = _decode(buf)
+                midx = self._owner_apply(moved, dist_lin, block_offsets)
+                replies[src] = np.ascontiguousarray(moved[midx]).reshape(-1)
+            payloads, _ = sparse_exchange(comm, replies, dtype, call, step=1)
 
         # Scatter the received values back into result-row order
         rows_flat = np.zeros((self._nrows(), ps), dtype=dtype)
@@ -237,11 +288,15 @@ class ExchangePlan:
         value : array_like
             The value to assign, broadcast to `selection.result_shape`.
         """
-        self._raise_on_error(check_dup=True)
-        rows_flat = self._value_to_rows(value, local.dtype)
-        sparse_push(self.comm, self.layout.distributed_axes, self._repl_total,
+        code = self._raise_on_error(check_dup=True)
+        # Build the rows only when there is no local error: a malformed value
+        # must not preempt the all-ranks consensus ValueError, and on error no
+        # payload is ever sent (the push phases run empty before the raise).
+        rows_flat = None if code else self._value_to_rows(value, local.dtype)
+        sparse_push(self.comm, self.put_channel,
+                    self.layout.distributed_axes, self._repl_total,
                     self._peers, self._block_offsets, self.payload_size,
-                    rows_flat, local)
+                    rows_flat, local, code=code, dtype=local.dtype)
 
     # ------------------------------------------------------- result <-> rows
 
@@ -422,11 +477,12 @@ def _group_peers(layout, owners, dist_local, sub, gcoords):
     return peers, oob_error, dup_error
 
 
-def sparse_push(comm, distributed_axes, repl_total, peers, block_offsets,
-                payload_size, rows_flat, local):
+def sparse_push(comm, channel, distributed_axes, repl_total, peers,
+                block_offsets, payload_size, rows_flat, local, code=0,
+                dtype=None):
     """
-    Route `rows_flat` to the owner ranks (NBX) and scatter each received
-    payload into `local` at its owner-local position.
+    Route `rows_flat` to the owner ranks and scatter each received payload
+    into `local` at its owner-local position.
 
     This is the single push primitive behind both `ExchangePlan.put`
     (advanced/replicated assignment, `payload_size` >= 1) and the structured
@@ -436,6 +492,10 @@ def sparse_push(comm, distributed_axes, repl_total, peers, block_offsets,
     ----------
     comm : MPI communicator
         The communicator to push over.
+    channel : Channel
+        The isolated communication channel driving this call. It binds fresh
+        tags to the call and serializes calls on the same routing, so pushes
+        never consume another call's messages.
     distributed_axes : tuple of int
         The array axes that are MPI-distributed.
     repl_total : int
@@ -446,26 +506,120 @@ def sparse_push(comm, distributed_axes, repl_total, peers, block_offsets,
         Offset of each payload element within an owner's replicated block.
     payload_size : int
         Number of payload elements per point.
-    rows_flat : numpy.ndarray
-        Values to push, shaped `(nrows, payload_size)` in owner-grouped order.
+    rows_flat : numpy.ndarray or None
+        Values to push, shaped `(nrows, payload_size)` in owner-grouped
+        order. `None` when a consensus error was detected before the value
+        array was built; the phases then run empty before the raise.
     local : numpy.ndarray
         The owner's rank-local array (written in place).
+    code : int, optional
+        This rank's consensus code for the call (`0` = no error).
+    dtype : numpy.dtype or None, optional
+        Payload dtype; defaults to `rows_flat.dtype` and is only needed when
+        `rows_flat` is `None` (so the empty error phases still type-match).
     """
+    dtype = rows_flat.dtype if rows_flat is not None else np.dtype(dtype)
+
     # Tell each owner which of its local slots we are about to write...
     headers = {r: _encode(payload_size, block_offsets, dist_lin)
                for r, (_, dist_lin) in peers.items()}
-    payloads = {r: rows_flat[rows].reshape(-1)
-                for r, (rows, _) in peers.items() if rows.size}
-    requests = sparse_exchange(comm, headers, np.int64, tag=43)
-    values = sparse_exchange(comm, payloads, rows_flat.dtype, tag=44)
+    payloads = {}
+    if rows_flat is not None:
+        payloads = {r: rows_flat[rows].reshape(-1)
+                    for r, (rows, _) in peers.items() if rows.size}
 
-    # ...then scatter whatever we received into our own local array
-    moved = np.moveaxis(local, distributed_axes, range(len(distributed_axes)))
-    for src, buf in requests.items():
-        offsets, dist_lin = _decode(buf)
-        elem = dist_lin[:, None] * repl_total + offsets[None, :]
-        midx = np.unravel_index(elem.reshape(-1), moved.shape)
-        moved[midx] = values[src]
+    with channel(comm) as call:
+        requests, codes = sparse_exchange(comm, headers, np.int64, call,
+                                          step=0, code=code)
+        # Consistent error across all ranks: drain the (empty) value phase so
+        # that no payload send can be left outstanding, then raise together.
+        if codes is not None and np.any(codes):
+            sparse_exchange(comm, {}, dtype, call, step=1)
+            raise ValueError(join_consensus_codes(codes))
+        values, _ = sparse_exchange(comm, payloads, dtype, call, step=1)
+
+        # ...then scatter whatever we received into our own local array
+        moved = np.moveaxis(local, distributed_axes,
+                            range(len(distributed_axes)))
+        for src, buf in requests.items():
+            offsets, dist_lin = _decode(buf)
+            elem = dist_lin[:, None] * repl_total + offsets[None, :]
+            midx = np.unravel_index(elem.reshape(-1), moved.shape)
+            moved[midx] = values[src]
+
+
+def channel_key(kind, identity, layout, selection=None, extra=b''):
+    """
+    Content-address the communication channel of a routing.
+
+    The key is built only from values identical on every rank (the global
+    shape, the global per-subrank decomposition bounds, the index selectors,
+    the stable array identity, and optional caller-supplied bytes), never from
+    process-local object ids, addresses or rank-local coordinate lists.
+
+    Parameters
+    ----------
+    kind : bytes
+        Routing family, `b'get'`/`b'put'` for a plan or `b'redist'`/
+        `b'redist-gate'` for a structured redistribution.
+    identity : int, tuple of int or None
+        Stable, rank-independent array identity (a distributed allocation
+        number, or a (target, source) pair for redistribution).
+    layout : Layout
+        Physical placement of the routed array.
+    selection : Selection or None
+        The normalized, global index for the routing. Rank-local advanced
+        array contents must never be folded in.
+    extra : bytes, optional
+        Additional globally-replicated content to fold in (e.g. the source
+        array global shape for a redistribution).
+
+    Returns
+    -------
+    bytes
+        An 8-byte digest usable as a `channel_for` key.
+    """
+    h = hashlib.blake2b(digest_size=8)
+    h.update(kind)
+    identities = identity if isinstance(identity, tuple) else (identity,)
+    for i in identities:
+        h.update(struct.pack('q', -1 if i is None else int(i)))
+    _hash_layout(h, layout)
+    if selection is not None:
+        for s in selection.selectors:
+            if isinstance(s, IndexScalar):
+                h.update(b's')
+                h.update(struct.pack('q', s.index))
+            elif isinstance(s, Affine):
+                h.update(b'a')
+                h.update(struct.pack('qqq', s.start, s.stop, s.step))
+            else:  # Explicit
+                h.update(b'e')
+                h.update(np.ascontiguousarray(s.coords, dtype=np.int64).tobytes())
+    h.update(struct.pack('q', len(extra)))
+    h.update(bytes(extra))
+    return h.digest()
+
+
+def _hash_layout(hasher, layout):
+    """Fold the globally-replicated layout content into `hasher`."""
+    hasher.update(struct.pack('q', len(layout.global_shape)))
+    for n in layout.global_shape:
+        hasher.update(struct.pack('q', int(n)))
+    for axis, dec in enumerate(layout.decomposition):
+        hasher.update(struct.pack('q', axis))
+        if dec is None:
+            hasher.update(b'r')
+            continue
+        hasher.update(b'd')
+        # `Decomposition` is a tuple of globally-replicated sub-ranges; the
+        # (first, last, size) of each sub-range identifies the placement.
+        for sub in dec:
+            arr = np.ascontiguousarray(sub, dtype=np.int64)
+            hasher.update(struct.pack('q', arr.size))
+            if arr.size:
+                hasher.update(struct.pack('qq', int(arr[0]), int(arr[-1])))
+
 
 
 def _encode(payload_size, block_offsets, dist_lin):

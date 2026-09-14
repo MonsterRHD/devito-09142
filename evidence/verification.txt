@@ -1,0 +1,5 @@
+Partial Irecv and Isend posting failure cleanup: 2 passed
+TestDataDistributed with MPICH: 43 passed
+Combined post-fix verification: 45 passed
+Four-rank duplicate and out-of-bounds failure followed by valid get and put: recovery=ok on every rank
+All verification runs used pytest with cache disabled.
