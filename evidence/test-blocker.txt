@@ -1,0 +1,3 @@
+执行命令：pytest -q -p no:cacheprovider tests/test_operator.py tests/test_mpi.py
+实际输出：ImportError while loading conftest；ModuleNotFoundError: No module named sympy
+环境事实：当前主机未完成 Devito requirements.txt 与 MPI 测试依赖安装，未产生测试断言结果。

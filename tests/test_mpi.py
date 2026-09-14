@@ -3694,6 +3694,52 @@ class TestTTIOp:
         assert calls[0].functions[1].name == 'v'
 
 
+class TestMemoryBudgetMPI:
+    """Cross-rank consistency of apply(memory_limit=...)."""
+
+    @pytest.mark.parallel(mode=[2, 4])
+    def test_consistent_decision(self, mode):
+        from devito.exceptions import MemoryBudgetExceeded
+
+        # An odd shape yields uneven per-rank local shares
+        grid = Grid(shape=(15, 15))
+        f = Function(name='f', grid=grid)
+        op = Operator(Eq(f, 1))
+
+        comm = grid.distributor.comm
+
+        local_need = op.estimate_memory()['host']
+        global_max = comm.allreduce(local_need, op=MPI.MAX)
+        global_min = comm.allreduce(local_need, op=MPI.MIN)
+        assert global_max > global_min
+
+        # Budget == smallest share: some ranks would fit locally, some not.
+        # The collective pre-check must make *every* rank fail with the very
+        # same, conservative (max) estimate.
+        with pytest.raises(MemoryBudgetExceeded) as exc:
+            op.apply(memory_limit=global_min)
+
+        err = exc.value
+        assert err.layers == ('total',)
+        assert err.estimate['host'] == global_max
+        assert err.estimate['total'] == global_max
+        assert err.budget['total'] == global_min
+        assert f._data is None
+
+        # The global budget admits every rank and the kernel runs
+        op.apply(memory_limit=global_max)
+        assert np.all(f.data == 1.)
+
+    @pytest.mark.parallel(mode=[2, 4])
+    def test_no_budget_unaffected(self, mode):
+        # Legacy, unbounded path keeps working under MPI
+        grid = Grid(shape=(16, 16))
+        f = Function(name='f', grid=grid)
+        op = Operator(Eq(f, 1))
+        op.apply()
+        assert np.all(f.data == 1.)
+
+
 def get_time_loop(op):
     iters = FindNodes(Iteration).visit(op)
     for i in iters:

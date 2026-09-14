@@ -1,0 +1,9 @@
+项目：Operator 执行前的跨内存层预算守卫
+Session：6aa75fd323ecb4dbbe8877fc
+Rubric ID：1｜状态：通过｜期望行为：执行前按主机、设备或总量预算拒绝超限并报告估算｜实际观察：apply 先调用预算检查，异常保存预算和估算｜直接证据：operator.py:1204-1297；exceptions.py:70-127
+Rubric ID：2｜状态：通过｜期望行为：估算包含替换对象、临时数组和映射数据｜实际观察：预算检查复用 estimate_memory 的参数准备路径｜直接证据：operator.py:973-1020、1052-1067
+Rubric ID：3｜状态：未通过｜期望行为：MPI 多 rank 或设备可见性形成一致决定｜实际观察：代码有 Allreduce 和设备分支，但本机缺少 MPI 可运行验证｜直接证据：operator.py:1088-1134；pytest 因缺少 sympy 在 conftest.py:7 中止｜原因：缺少跨 rank 行为证据｜影响：任一 rank 不单独进入内核的行为未通过验证｜证据位置：evidence/test-blocker.txt
+Rubric ID：4｜状态：未通过｜期望行为：预算、设备查询和内核错误可区分且预检查不触发内核｜实际观察：代码定义三类异常，但设备和内核场景未运行｜直接证据：exceptions.py:54-157；operator.py:1160-1205；pytest 未进入测试｜原因：缺少异常路径验证｜影响：真实设备和内核边界的传播顺序未通过验证｜证据位置：evidence/test-blocker.txt
+Rubric ID：5｜状态：通过｜期望行为：未提供预算时保持原有执行行为｜实际观察：memory_limit 默认 None，原 apply 主流程保留｜直接证据：operator.py:1204-1210、1290-1320
+Rubric ID：6｜状态：通过｜期望行为：超限后提高预算或关闭预算可干净重试｜实际观察：预检查不写入 op 状态，后续 apply 可重新进入主流程｜直接证据：operator.py:1052-1205、1290-1298
+验证摘要：固定基线 110423337f7f3e7e618beefde76a35cfb785a665；代码编译检查通过；行为测试因缺少 sympy 依赖阻断。完成度：部分完成。

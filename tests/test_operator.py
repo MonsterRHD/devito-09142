@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import pickle
 from functools import reduce
 from itertools import permutations
 from operator import mul
@@ -23,7 +24,10 @@ from devito import (  # noqa
     dimensions, div, error, exp, grad, sin, switchconfig
 )
 from devito.arch.archinfo import Device
-from devito.exceptions import InvalidOperator
+from devito.exceptions import (
+    DeviceQueryError, ExecutionError, InvalidArgument, InvalidOperator,
+    MemoryBudgetExceeded, MemoryPrecheckError
+)
 from devito.finite_differences.differentiable import diff2sympy
 from devito.ir.equations import ClusterizedEq
 from devito.ir.equations.algorithms import lower_exprs
@@ -2581,3 +2585,321 @@ class TestEstimateMemory:
 
         # Clean up
         os.remove("memory_estimate_output.json")
+
+
+def _sum_sizes(funcs):
+    return sum(f.size_allocated*np.dtype(f.dtype).itemsize for f in funcs)
+
+
+class TestMemoryBudget:
+    """
+    Tests for the optional pre-execution memory budget enforcement enabled
+    through `Operator.apply(memory_limit=...)`.
+    """
+
+    def test_budget_pass(self):
+        grid = Grid(shape=(16, 16))
+        f = Function(name='f', grid=grid)
+        op = Operator(Eq(f, 1))
+
+        # Generous int budget: kernel runs (both apply and __call__)
+        op.apply(memory_limit=10**12)
+        assert np.all(f.data == 1.)
+
+        f.data[:] = 0
+        op(memory_limit=10**12)
+        assert np.all(f.data == 1.)
+
+    def test_budget_total_exceeded(self):
+        grid = Grid(shape=(16, 16))
+        f = Function(name='f', grid=grid)
+        g = TimeFunction(name='g', grid=grid, save=4)
+        op = Operator([Eq(f, 1), Eq(g, g + 1)])
+
+        need = op.estimate_memory()
+
+        with pytest.raises(MemoryBudgetExceeded) as exc:
+            op.apply(memory_limit=1)
+
+        err = exc.value
+        # Stable attributes: estimate and budget in bytes
+        assert err.op_name == op.name
+        assert err.layers == ('total',)
+        assert err.estimate['host'] == need['host']
+        assert err.estimate['device'] == need['device']
+        assert err.estimate['total'] == need['host'] + need['device']
+        assert err.budget['total'] == 1
+        assert err.budget['host'] is None
+        # Nothing was allocated or compiled on a failed pre-check
+        assert f._data is None and g._data is None
+        assert op._lib is None
+        # The report carries the numbers and the operator name
+        assert str(need['host']) in str(err) or 'MB' in str(err) or 'KB' in str(err)
+        assert op.name in str(err)
+
+    def test_budget_per_layer(self):
+        grid = Grid(shape=(16, 16))
+        f = Function(name='f', grid=grid)
+        op = Operator(Eq(f, 1))
+
+        with pytest.raises(MemoryBudgetExceeded) as exc:
+            op.apply(memory_limit={'host': 1})
+        assert exc.value.layers == ('host',)
+
+        with pytest.raises(MemoryBudgetExceeded) as exc:
+            op.apply(memory_limit={'host': 1, 'total': 1})
+        assert exc.value.layers == ('host', 'total')
+
+        # A device-only cap cannot be violated on a non-device platform, so
+        # the Operator is admitted and runs
+        op.apply(memory_limit={'device': 1})
+        assert np.all(f.data == 1.)
+
+        # Availability is reported, with no device on a CPU run
+        with pytest.raises(MemoryBudgetExceeded) as exc:
+            op.apply(memory_limit={'total': 1})
+        assert exc.value.available['host'] > 0
+        assert exc.value.available['device'] is None
+
+    @pytest.mark.parametrize('bad', [-1, 1.5, '1GB', True, (), [], {},
+                                    {'foo': 1}, {'host': -1},
+                                    {'host': 1.5}, {'total': False}])
+    def test_budget_invalid_forms(self, bad):
+        grid = Grid(shape=(8, 8))
+        f = Function(name='f', grid=grid)
+        op = Operator(Eq(f, 1))
+
+        with pytest.raises(InvalidArgument):
+            op.apply(memory_limit=bad)
+
+        # An invalid budget must not have caused any allocation/compilation
+        assert op._lib is None
+        assert f._data is None
+
+    def test_budget_numpy_integer(self):
+        grid = Grid(shape=(8, 8))
+        f = Function(name='f', grid=grid)
+        op = Operator(Eq(f, 1))
+
+        op.apply(memory_limit=np.int64(10**12))
+        assert np.all(f.data == 1.)
+
+    def test_budget_no_allocation_and_retry(self, caplog):
+        grid = Grid(shape=(32, 32))
+        f = Function(name='f', grid=grid)
+        g = TimeFunction(name='g', grid=grid, save=4)
+        op = Operator([Eq(f, 1), Eq(g, g + 1)])
+
+        with switchconfig(log_level='DEBUG'), \
+                caplog.at_level(logging.DEBUG, logger='devito'):
+            with pytest.raises(MemoryBudgetExceeded):
+                op.apply(memory_limit=1)
+            # The estimate must not have allocated anything
+            assert "Allocating" not in caplog.text
+
+        assert f._data is None and g._data is None
+        assert op._lib is None
+        assert 'autotuning' not in op._state
+
+        # Retry with a sufficient budget: runs and produces the right result
+        op.apply(memory_limit=10**12)
+        assert np.all(f.data == 1.)
+
+        # Retry with no budget at all: legacy behavior, runs again
+        f.data[:] = 0
+        op.apply()
+        assert np.all(f.data == 1.)
+
+        # Failing again still raises the very same stable exception
+        with pytest.raises(MemoryBudgetExceeded) as exc:
+            op.apply(memory_limit=1)
+        assert exc.value.layers == ('total',)
+
+    def test_budget_blocks_before_autotuning(self):
+        grid = Grid(shape=(16, 16))
+        f = Function(name='f', grid=grid)
+        op = Operator(Eq(f, 1))
+
+        with pytest.raises(MemoryBudgetExceeded):
+            op.apply(memory_limit=1, autotune='basic')
+
+        assert 'autotuning' not in op._state
+        assert op._lib is None
+
+    def test_budget_overrides(self):
+        grid0 = Grid(shape=(64, 64))
+        f0 = Function(name='f0', grid=grid0)
+        op = Operator(Eq(f0, 1))
+
+        big = op.estimate_memory()['host']
+
+        grid1 = Grid(shape=(8, 8))
+        f1 = Function(name='f1', grid=grid1)
+        small = op.estimate_memory(f0=f1)['host']
+        assert small < big
+
+        middle = (big + small) // 2
+
+        # Default arguments don't fit the middle budget
+        with pytest.raises(MemoryBudgetExceeded) as exc:
+            op.apply(memory_limit=middle)
+        assert exc.value.estimate['host'] == big
+
+        # But the small runtime override does, and the kernel actually runs
+        op.apply(f0=f1, memory_limit=middle)
+        assert np.all(f1.data == 1.)
+
+        # A tight budget against the override reports *its* footprint
+        with pytest.raises(MemoryBudgetExceeded) as exc:
+            op.apply(f0=f1, memory_limit=small - 1)
+        assert exc.value.estimate['host'] == small
+
+    def test_budget_sparse(self):
+        grid = Grid(shape=(32, 32))
+        f = Function(name='f', grid=grid, space_order=2)
+        src = SparseFunction(name='src', grid=grid, npoint=500)
+        op = Operator(src.inject(field=f, expr=src))
+
+        need = op.estimate_memory()['host']
+
+        with pytest.raises(MemoryBudgetExceeded) as exc:
+            op.apply(memory_limit=need - 1)
+        assert exc.value.estimate['host'] == need
+
+        # An exact fit is admitted and the kernel runs
+        op.apply(memory_limit=need)
+
+    def test_budget_temp_arrays(self):
+        grid = Grid(shape=(101, 101))
+        f = TimeFunction(name='f', grid=grid, space_order=2)
+        g = TimeFunction(name='g', grid=grid, space_order=2)
+        a = Function(name='a', grid=grid, space_order=2)
+        b = Function(name='b', grid=grid, space_order=0)
+
+        eq0 = Eq(f.forward, g + sin(a).dx)
+        eq1 = Eq(g.forward, f + sin(a).dx)
+        opt = ('advanced', {'cire-minmem': True})
+        op = Operator([eq0, eq1], opt=opt)
+
+        # Sanity: a heap C-land temporary is indeed generated
+        assert TestEstimateMemory._array_temp in str(op.ccode)
+
+        array_check = (b.shape_allocated[0] + 1)*b.shape_allocated[1]
+        array_check *= np.dtype(b.dtype).itemsize
+        need = _sum_sizes((f, g, a)) + array_check
+
+        assert op.estimate_memory()['host'] == need
+
+        with pytest.raises(MemoryBudgetExceeded) as exc:
+            op.apply(memory_limit=need - 1, time_M=1)
+        assert exc.value.estimate['host'] == need
+
+        op.apply(memory_limit=need, time_M=1)
+
+    def test_budget_device_query_failure(self, monkeypatch):
+        grid = Grid(shape=(16, 16))
+        f = Function(name='f', grid=grid)
+
+        # A device Operator on a host with no queryable device: the query
+        # failure is a distinct, stable outcome (not a budget error, not a
+        # kernel error)
+        with switchconfig(language='openacc', platform='nvidiaX'):
+            op = Operator(Eq(f, 1))
+            monkeypatch.setattr(op._platform, 'memavail',
+                                lambda deviceid=0: None)
+
+            with pytest.raises(DeviceQueryError) as exc:
+                op.apply(memory_limit=10**12)
+
+            err = exc.value
+            assert isinstance(err, MemoryPrecheckError)
+            assert not isinstance(err, MemoryBudgetExceeded)
+            assert not isinstance(err, ExecutionError)
+            assert err.reason
+            assert op._lib is None
+            assert f._data is None
+
+    def test_budget_device_query_exception(self, monkeypatch):
+        grid = Grid(shape=(16, 16))
+        f = Function(name='f', grid=grid)
+
+        def boom(deviceid=0):
+            raise RuntimeError("driver went away")
+
+        with switchconfig(language='openacc', platform='nvidiaX'):
+            op = Operator(Eq(f, 1))
+            monkeypatch.setattr(op._platform, 'memavail', boom)
+
+            with pytest.raises(DeviceQueryError, match="driver went away"):
+                op.apply(memory_limit=10**12)
+
+    def test_budget_device_visibility(self, monkeypatch):
+        # The device query must honour CUDA_VISIBLE_DEVICES, mapping the rank
+        # to the corresponding physical device id.
+        grid = Grid(shape=(16, 16))
+        f = Function(name='f', grid=grid)
+
+        seen = {}
+
+        def fake_memavail(deviceid=0):
+            seen['deviceid'] = deviceid
+            return 10**12
+
+        monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '3')
+        with switchconfig(language='openacc', platform='nvidiaX'):
+            op = Operator(Eq(f, 1))
+            monkeypatch.setattr(op._platform, 'memavail', fake_memavail)
+
+            # Tiny budget: query succeeds (visibility resolved), then the
+            # footprint exceeds the budget before any compilation happens
+            with pytest.raises(MemoryBudgetExceeded):
+                op.apply(memory_limit=1)
+            assert seen['deviceid'] == 3
+
+    def test_budget_exception_hierarchy(self):
+        assert issubclass(MemoryBudgetExceeded, MemoryPrecheckError)
+        assert issubclass(DeviceQueryError, MemoryPrecheckError)
+        assert not issubclass(MemoryPrecheckError, ExecutionError)
+        assert not issubclass(MemoryBudgetExceeded, ExecutionError)
+
+    def test_budget_no_budget_is_legacy(self):
+        # No memory_limit: nothing changes w.r.t. the historical path
+        grid = Grid(shape=(8, 8))
+        f = Function(name='f', grid=grid)
+        op = Operator(Eq(f, 1))
+        op.apply()
+        assert np.all(f.data == 1.)
+
+    def test_budget_estimate_memory_unaffected(self, caplog):
+        grid = Grid(shape=(16, 16))
+        f = Function(name='f', grid=grid)
+        op = Operator(Eq(f, 1))
+
+        # estimate_memory stays allocation-free and never raises on budgets
+        with switchconfig(log_level='DEBUG'), \
+                caplog.at_level(logging.DEBUG, logger='devito'):
+            summary = op.estimate_memory()
+            assert "Allocating" not in caplog.text
+
+        assert summary['host'] > 0
+        assert f._data is None
+
+    def test_budget_pickle_after_failed_precheck(self):
+        grid = Grid(shape=(8, 8))
+        f = Function(name='f', grid=grid)
+        op = Operator(Eq(f, 1))
+
+        with pytest.raises(MemoryBudgetExceeded):
+            op.apply(memory_limit=1)
+
+        # A failed pre-check leaves the Operator serializable
+        new_op = pickle.loads(pickle.dumps(op))
+
+        # Budget enforcement works on the reconstructed Operator too
+        with pytest.raises(MemoryBudgetExceeded):
+            new_op.apply(memory_limit=1)
+
+        # And a budgeted execution through it works (f passed explicitly, as
+        # per the usual unpickled-Operator convention)
+        new_op.apply(f=f, memory_limit=10**12)
+        assert np.all(f.data == 1.)
