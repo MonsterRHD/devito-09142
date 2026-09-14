@@ -1,6 +1,7 @@
 import ctypes
 import shutil
 from collections import OrderedDict, namedtuple
+from collections.abc import Mapping
 from contextlib import suppress
 from functools import cached_property
 from math import ceil
@@ -16,7 +17,8 @@ from devito.arch import (
 )
 from devito.data import default_allocator
 from devito.exceptions import (
-    CompilationError, ExecutionError, InvalidArgument, InvalidOperator
+    CompilationError, DeviceQueryError, ExecutionError, InvalidArgument,
+    InvalidOperator, MemoryBudgetExceeded, MemoryPrecheckError
 )
 from devito.ir.clusters import ClusterGroup, clusterize
 from devito.ir.equations import LoweredEq, concretize_subdims, lower_exprs
@@ -49,6 +51,66 @@ __all__ = ['Operator']
 
 
 _layers = (disk_layer, host_layer, device_layer)
+
+
+# Layers a caller may constrain through `apply(memory_limit=...)`, in the
+# stable order used in error reporting
+_memory_limit_layers = ('host', 'device', 'total')
+
+# Status codes exchanged across MPI ranks during the memory-budget pre-check
+_precheck_status_ok = 0
+_precheck_status_device = 1
+_precheck_status_estimate = 2
+
+
+def _normalize_memory_limit(limit):
+    """
+    Normalize a user-provided ``memory_limit`` into a mapping with one entry
+    per layer in `_memory_limit_layers`, where ``None`` means "unconstrained".
+
+    Accepted forms:
+
+    * a non-negative ``int`` (or numpy integer): a unified ``'total'`` budget
+      in bytes;
+    * a mapping with any subset of the keys ``'host'``, ``'device'`` and
+      ``'total'``, each bound to a non-negative integer amount of bytes (a
+      `MemoryEstimate` is thus directly accepted).
+    """
+    if not isinstance(limit, bool) and is_integer(limit):
+        if limit < 0:
+            raise InvalidArgument(
+                f"`memory_limit` must be non-negative, got {int(limit)}"
+            )
+        return {'host': None, 'device': None, 'total': int(limit)}
+
+    if not isinstance(limit, Mapping):
+        raise InvalidArgument(
+            "`memory_limit` must be an int (bytes) or a mapping with any "
+            "subset of the keys ('host', 'device', 'total')"
+        )
+
+    unknown = sorted(set(limit) - set(_memory_limit_layers))
+    if unknown:
+        raise InvalidArgument(
+            f"Unknown `memory_limit` layer(s) `{unknown}`; expected any of "
+            f"{_memory_limit_layers}"
+        )
+    if not limit:
+        raise InvalidArgument(
+            "`memory_limit` must constrain at least one of ('host', 'device', "
+            "'total')"
+        )
+
+    out = {l: None for l in _memory_limit_layers}
+    for layer, value in limit.items():
+        if isinstance(value, bool) or not is_integer(value) or value < 0:
+            raise InvalidArgument(
+                f"`memory_limit['{layer}']` must be a non-negative integer "
+                f"amount of bytes, got `{value!r}`"
+            )
+        out[layer] = int(value)
+
+    return out
 
 
 class Operator(Callable):
@@ -911,6 +973,17 @@ class Operator(Callable):
     def __call__(self, **kwargs):
         return self.apply(**kwargs)
 
+    def _memory_estimate_arguments(self, **kwargs):
+        """
+        Build the `ArgumentsMap` used for an allocation-free memory estimate.
+
+        This is the single entry point shared by `estimate_memory` and by the
+        `apply(memory_limit=...)` pre-check, so the two always agree on what
+        is counted (Functions, overrides, sparse tables, C-land temporaries,
+        memmaps, ...) and neither one touches or allocates any data.
+        """
+        return self._prepare_arguments(estimate_memory=True, **kwargs)
+
     def estimate_memory(self, **kwargs):
         """
         Estimate the memory consumed by the Operator without touching or allocating any
@@ -943,7 +1016,7 @@ class Operator(Callable):
         """
         # Build the arguments list for which to get the memory consumption
         # This is so that the estimate will factor in overrides
-        args = self._prepare_arguments(estimate_memory=True, **kwargs)
+        args = self._memory_estimate_arguments(**kwargs)
         mem = args.nbytes_consumed
 
         memreport = {'host': mem[host_layer], 'device': mem[device_layer]}
@@ -958,7 +1031,177 @@ class Operator(Callable):
         # Hook for enriching memory report with additional metadata
         return {}
 
-    def apply(self, **kwargs):
+    def _memory_precheck_comm(self, est, kwargs):
+        """
+        The MPI communicator the memory-budget pre-check is collective over.
+        Fall back to the communicator carried by the (default or overridden)
+        grids if the regular arguments processing failed before an
+        `ArgumentsMap` could be built.
+        """
+        if est is not None:
+            return est.comm
+
+        for p in self.input:
+            with suppress(AttributeError):
+                grid = kwargs.get(p.name, p).grid
+                if grid is not None:
+                    return grid.comm
+
+        return MPI.COMM_NULL
+
+    def _check_memory_budget(self, memory_limit, **kwargs):
+        """
+        Enforce a caller-provided memory budget before any data allocation,
+        auto-tuning or kernel submission.
+
+        The check reuses the same allocation-free machinery as
+        `estimate_memory`, so its accounting honours runtime overrides
+        (Function/TimeFunction/SparseFunction), C-land temporaries, memmaps
+        and the MPI-local share of every rank. The success/failure decision
+        is made consistent across all ranks of the communicator.
+        """
+        budget = _normalize_memory_limit(memory_limit)
+
+        # --- Local estimation (no data touched, no state recorded) ---
+        status = _precheck_status_ok
+        estimate_error = None
+        device_query_reason = None
+        device_query_cause = None
+        host_req = 0
+        device_req = 0
+        host_avail = -1
+        device_avail = -1
+        deviceid = None
+        est = None
+
+        try:
+            est = self._memory_estimate_arguments(**kwargs)
+            mem = est.nbytes_consumed
+        except Exception as e:
+            # E.g., an invalid override. Re-raised verbatim below, after the
+            # cross-rank synchronization so that no rank can hang
+            status = _precheck_status_estimate
+            estimate_error = e
+        else:
+            host_req = int(mem[host_layer])
+            device_req = int(mem[device_layer])
+
+            # Advisory only: host memory available to this rank. A failure
+            # here never blocks a budgeted run; the budget is the cap.
+            try:
+                nproc = est.grid.distributor.nprocs_local
+            except AttributeError:
+                nproc = 1
+            try:
+                host_avail = int(ANYCPU.memavail() / nproc)
+            except Exception:
+                host_avail = -1
+
+            # A device target requires resolving visibility and querying the
+            # free device memory. This is a distinguishable outcome: on an
+            # orchestration node without driver/hardware the footprint cannot
+            # be validated against physical device memory.
+            if isinstance(self._platform, Device):
+                reason = None
+                try:
+                    deviceid = est._physical_deviceid
+                    free = self._platform.memavail(deviceid=deviceid)
+                    if not is_integer(free) or free < 0:
+                        reason = (
+                            "could not determine the available device memory "
+                            "(no visible device or driver/runtime unavailable)"
+                        )
+                    else:
+                        device_avail = int(free)
+                except Exception as e:
+                    reason = f"device memory query failed: {e}"
+                    device_query_cause = e
+                if reason is not None:
+                    status = _precheck_status_device
+                    device_query_reason = reason
+
+        # --- Cross-rank synchronization: one consistent decision ---
+        comm = self._memory_precheck_comm(est, kwargs)
+        collective = (comm is not None and comm is not MPI.COMM_NULL and
+                      getattr(comm, 'size', 1) > 1)
+
+        if collective:
+            req_send = np.asarray([host_req, device_req], dtype=np.int64)
+            avail_send = np.asarray([host_avail, device_avail], dtype=np.int64)
+            status_send = np.asarray([status], dtype=np.int64)
+
+            req_recv = np.empty_like(req_send)
+            avail_recv = np.empty_like(avail_send)
+            status_recv = np.empty_like(status_send)
+
+            # First round: agree on a conservative global footprint
+            # (MAX), availability (MIN) and pre-check status (MAX)
+            comm.Allreduce(req_send, req_recv, op=MPI.MAX)
+            comm.Allreduce(avail_send, avail_recv, op=MPI.MIN)
+            comm.Allreduce(status_send, status_recv, op=MPI.MAX)
+
+            host_req, device_req = (int(i) for i in req_recv)
+            host_avail, device_avail = (int(i) for i in avail_recv)
+            status = int(status_recv[0])
+
+        # Local verdict against the (possibly global, MAX) footprint. Every
+        # rank compares the same conservative estimate against its own budget
+        verdict = [
+            int(budget['host'] is not None and host_req > budget['host']),
+            int(budget['device'] is not None and device_req > budget['device']),
+            int(budget['total'] is not None
+                and host_req + device_req > budget['total']),
+        ]
+
+        if collective:
+            # Second round: a single rank's violation blocks the whole
+            # collective Operator, so reduce the verdicts with MAX as well
+            flags_send = np.asarray(verdict, dtype=np.int64)
+            flags_recv = np.empty_like(flags_send)
+            comm.Allreduce(flags_send, flags_recv, op=MPI.MAX)
+            verdict = [int(i) for i in flags_recv]
+
+        if status == _precheck_status_estimate:
+            if estimate_error is not None:
+                raise estimate_error
+            raise MemoryPrecheckError(
+                f"Memory budget pre-check of Operator `{self.name}` failed on "
+                "one or more MPI ranks while estimating the memory footprint"
+            )
+
+        if status == _precheck_status_device:
+            if device_query_reason is not None:
+                raise DeviceQueryError(
+                    self.name, device_query_reason, deviceid=deviceid
+                ) from device_query_cause
+            raise DeviceQueryError(
+                self.name,
+                "the device memory query failed on one or more peer MPI ranks",
+                deviceid=deviceid,
+            )
+
+        # --- Budget comparison ---
+        estimate = {
+            'host': host_req,
+            'device': device_req,
+            'total': host_req + device_req,
+        }
+        available = {
+            'host': host_avail if host_avail >= 0 else None,
+            'device': device_avail if device_avail >= 0 else None,
+        }
+
+        violated = tuple(
+            layer for layer, flag in zip(_memory_limit_layers, verdict,
+                                         strict=True)
+            if flag
+        )
+        if violated:
+            raise MemoryBudgetExceeded(
+                self.name, budget, estimate, available, violated
+            )
+
+    def apply(self, memory_limit=None, **kwargs):
         """
         Execute the Operator.
 
@@ -984,6 +1227,32 @@ class Operator(Callable):
           Dimensions, this typically implies iterating over the entire physical
           domain). So now ``k`` can be either ``d_m`` or ``d_M``, while ``v``
           is an integer value.
+
+        Parameters
+        ----------
+        memory_limit : int or Mapping, optional
+            Optional pre-execution memory budget, in bytes. When provided, the
+            Operator's memory footprint is estimated -- without allocating or
+            touching any data -- *after* the runtime arguments are resolved
+            (including overridden Function/TimeFunction/SparseFunction, C-land
+            temporaries, memmaps and the MPI-local share of every rank) but
+            *before* JIT compilation, lazy allocation, auto-tuning and kernel
+            submission. Accepted forms:
+
+            * an int: a unified ``'total'`` budget;
+            * a mapping with any subset of the keys ``'host'``, ``'device'``
+              and ``'total'`` for per-layer budgets.
+
+            If the estimated footprint exceeds any supplied budget, a
+            `MemoryBudgetExceeded` carrying both the estimate and the budget is
+            raised and execution is blocked. On a device platform, a device
+            whose availability cannot be queried results in a
+            `DeviceQueryError`. With MPI, all ranks reach the same decision
+            collectively (based on the largest per-rank footprint). A failed
+            pre-check allocates nothing and records no state, so the same
+            Operator may be retried with a higher budget (or without any
+            budget) safely. When ``None`` (the default), the historical lazy,
+            unbounded behavior is preserved in full.
 
         Examples
         --------
@@ -1020,6 +1289,13 @@ class Operator(Callable):
         >>> op = Operator(Eq(u3.forward, u3 + 1))
         >>> summary = op.apply(time_M=10)
         """
+        # Optional pre-flight memory budget. It must run first, before the JIT
+        # compilation and the (potentially allocating/auto-tuning) arguments
+        # processing, so that an over-budget run is blocked without leaving
+        # any allocation or state behind.
+        if memory_limit is not None:
+            self._check_memory_budget(memory_limit, **kwargs)
+
         # Compile the operator before building the arguments list
         # to avoid out of memory with greedy compilers
         cfunction = self.cfunction

@@ -1,0 +1,9 @@
+项目：devitocodes-devito-e791d5dd-ff38-4db0-8698-6d10e126beea｜Operator 执行前的跨内存层预算守卫
+Session：6aa75fd323ecb4dbbe8877fc｜Harness：Trae｜有效轮数：106
+Rubric ID：1｜状态：通过｜期望行为：调用方可设置 host、device 或 total 预算并在执行前收到含估算与预算的超限异常｜实际观察：整数总预算和分层预算均在 JIT、分配与内核前检查，异常暴露 estimate、budget 和 layers｜直接证据：operator.py:1052-1202；exceptions.py:70-127；TestMemoryBudget 27 passed
+Rubric ID：2｜状态：通过｜期望行为：估算包含运行时替换对象、稀疏函数、编译临时数组和映射数据｜实际观察：预算检查与 estimate_memory 共用无分配参数准备，替换 Function、SparseFunction 和 C 临时数组的估算及边界执行均通过｜直接证据：operator.py:976-1028；tests/test_operator.py:2729-2797；TestEstimateMemory 与错误回归 75 passed
+Rubric ID：3｜状态：通过｜期望行为：MPI 各 rank 和设备可见性对预算形成一致允许或拒绝决定｜实际观察：2 rank 与 4 rank 均以最大局部占用一致拒绝较小预算并以全局预算共同执行，设备可见 ID 3 被用于可用内存查询｜直接证据：operator.py:1123-1162；tests/test_mpi.py:3697-3740；TestMemoryBudgetMPI 4 passed
+Rubric ID：4｜状态：通过｜期望行为：预算超限、设备查询失败和内核错误可区分，预检查不触发内核或自动调优｜实际观察：预算和设备查询异常属于独立预检查层级，超限后 _lib、数据和 autotuning 状态保持未创建，既有 ExecutionError 测试通过｜直接证据：exceptions.py:57-157；tests/test_operator.py:2687-2863；tests/test_error_checking.py；对应验证通过
+Rubric ID：5｜状态：通过｜期望行为：未提供预算时既有 apply、estimate_memory、memmap、自动调优、惰性分配和替换行为不变｜实际观察：memory_limit 默认为 None 并直接进入原执行路径，既有估算、替换、临时数组、稀疏对象和错误检查回归通过｜直接证据：operator.py:1204-1310；TestEstimateMemory 与 test_error_checking 共 75 passed
+Rubric ID：6｜状态：通过｜期望行为：同一 Operator 超限后提高或关闭预算可重新解析并执行且不复用失败状态｜实际观察：超限后无分配、无编译和无调优状态；随后提高预算和关闭预算均执行成功，序列化后的 Operator 也可重新检查与执行｜直接证据：tests/test_operator.py:2687-2716、2887-2905；TestMemoryBudget 27 passed
+验证摘要：TestMemoryBudget 27 passed；TestMemoryBudgetMPI 在真实 MPICH 的 2/4 rank 下 4 passed；TestEstimateMemory 与 test_error_checking 75 passed；全部命令禁用 pytest 缓存。

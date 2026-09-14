@@ -1,0 +1,4 @@
+TestMemoryBudget: 27 passed
+TestMemoryBudgetMPI: 4 passed with MPICH at 2 and 4 ranks
+TestEstimateMemory and test_error_checking: 75 passed
+All verification runs used pytest with cache disabled.
