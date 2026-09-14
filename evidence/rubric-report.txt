@@ -1,0 +1,9 @@
+项目：分布式索引交换的消息隔离与失败回收
+Session：6aa75fdb23ecb4dbbe88784f
+Rubric ID：1｜状态：通过｜期望行为：并发或嵌套计划使用隔离通信标识｜实际观察：plan 为 get 和 put 建立内容寻址通道并按调用分配标签｜直接证据：plan.py:177-198；transport.py:100-205
+Rubric ID：2｜状态：通过｜期望行为：header 与 payload 在不同 dtype、Data 和 self 路径配对｜实际观察：每次调用分开执行 envelope 和 payload 阶段，self 直接本地返回｜直接证据：transport.py:243-397
+Rubric ID：3｜状态：未通过｜期望行为：越界或重复目标一致退出并清理发送｜实际观察：代码提供 consensus 和请求清理，但本机没有 MPI 行为验证｜直接证据：plan.py:199-218；transport.py:216-241；pytest 因缺少 sympy 中止｜原因：缺少失败交错证据｜影响：真实异常时所有发送均清理的行为未通过验证｜证据位置：evidence/test-blocker.txt
+Rubric ID：4｜状态：未通过｜期望行为：传输失败后重建或切换操作可恢复｜实际观察：Waitall 异常调用清理，但未运行恢复序列｜直接证据：transport.py:334-385；plan.py:238-286｜原因：缺少恢复行为证据｜影响：旧请求不残留的恢复语义未通过验证｜证据位置：evidence/test-blocker.txt
+Rubric ID：5｜状态：通过｜期望行为：单进程和 MPI=full 的既有索引与 dtype 行为兼容｜实际观察：保留单进程 self 快路径并使用 wire dtype 映射｜直接证据：transport.py:243-288
+Rubric ID：6｜状态：通过｜期望行为：无远端 peer 或 self 投递不额外通信｜实际观察：单进程直接返回，self 不进入 Isend/Irecv｜直接证据：transport.py:278-318
+验证摘要：固定基线 110423337f7f3e7e618beefde76a35cfb785a665；代码编译检查通过；MPI 行为测试因缺少 sympy 和 MPI 运行环境阻断。完成度：部分完成。

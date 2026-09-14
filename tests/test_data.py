@@ -1,4 +1,5 @@
 import gc
+import traceback
 
 import numpy as np
 import pytest
@@ -1040,6 +1041,70 @@ class TestDataDistributed:
             f.data[oob_index] = np.ones(oob_index.size, dtype=f.dtype)
         with pytest.raises(ValueError, match="rank 0:.*out-of-bounds"):
             f.data[oob_index]
+
+    @pytest.mark.parallel(mode=4)
+    def test_advanced_indexing_concurrent_threads(self, mode):
+        """
+        Two threads on every rank concurrently drive global get/put on the
+        same plan and on a second, different-dtype array. Messages must stay
+        paired to their own request/channel: no header parsed as another
+        message, no blocking, and reusable plans over many iterations.
+        """
+        import threading
+
+        grid = Grid(shape=(8,))
+
+        from devito.mpi import MPI
+        if MPI.Query_thread() < MPI.THREAD_MULTIPLE:
+            pytest.skip("MPI does not provide MPI_THREAD_MULTIPLE")
+
+        nprocs = grid.distributor.nprocs
+        f = Function(name='f', grid=grid, space_order=0, dtype=np.int32)
+        g = Function(name='g', grid=grid, space_order=0, dtype=np.int64)
+
+        rank = grid.distributor.myrank
+        global_f = np.arange(8, dtype=np.int32)
+        global_g = (np.arange(8, dtype=np.int64) * 2 + 1)
+        # Canonical local state first, so an interleaved read always has a
+        # valid value to compare against (writer writes are idempotent).
+        f.data_local[:] = global_f[f.local_indices]
+        g.data_local[:] = global_g[g.local_indices]
+        idx_a = np.array_split(np.arange(8)[::-1], nprocs)[rank]
+        idx_b = np.array_split(np.arange(8), nprocs)[rank]
+        niter = 20
+        errors = []
+
+        def reader():
+            try:
+                for k in range(niter):
+                    idx = idx_a if k % 2 else idx_b
+                    assert np.all(f.data[idx] == global_f[idx])
+                    assert np.all(g.data[idx] == global_g[idx])
+            except Exception:
+                errors.append(traceback.format_exc())
+
+        def writer():
+            try:
+                for k in range(niter):
+                    idx = idx_a if k % 2 else idx_b
+                    # Idempotent canonical values, so an interleaving read is
+                    # always consistent; exercises put on the same plan while
+                    # a get on it is in flight on another thread.
+                    f.data[idx] = global_f[idx]
+                    g.data[idx] = global_g[idx]
+            except Exception:
+                errors.append(traceback.format_exc())
+
+        threads = [threading.Thread(target=reader), threading.Thread(target=writer)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(120)
+        assert not any(t.is_alive() for t in threads)
+        assert not errors, errors[0]
+
+        assert np.all(f.data_local == global_f[f.local_indices])
+        assert np.all(g.data_local == global_g[g.local_indices])
 
     @pytest.mark.parallel(mode=4)
     def test_advanced_indexing_local_only_no_comm(self, mode):

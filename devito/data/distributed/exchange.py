@@ -46,7 +46,10 @@ class Exchange:
         )
         self._layout = Layout(data._distributor, data._decomposition, global_shape)
         self._selection = Selection.from_index(idx, global_shape)
-        self._plan = ExchangePlan.build(self._selection, self._layout)
+        # The allocation identity is assigned in the same order on every SPMD
+        # rank, so two equally-shaped arrays still get distinct channels.
+        self._plan = ExchangePlan.build(self._selection, self._layout,
+                                        identity=getattr(data, '_dist_uid', None))
 
     def get(self):
         """Return `data[idx]` as a NumPy array."""
